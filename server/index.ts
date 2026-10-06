@@ -21,6 +21,8 @@ export function optionsFromEnvironment(env: NodeJS.ProcessEnv = process.env): Se
   }
   return {
     mode, production, publicOrigin, operatorToken: env.OPERATOR_TOKEN,
+    controlStatePath: mode === 'mock' ? (env.CONTROL_STATE_PATH ?? 'data/control-state.json') : undefined,
+    enterpriseCollectorUrl: env.ENTERPRISE_COLLECTOR_URL, enterpriseCollectorToken: env.COLLECTOR_TOKEN,
     collector: mode === 'live' ? new HttpTelemetryCollector({
       baseUrl: env.TELEMETRY_COLLECTOR_URL,
       diagnosticsUrl: env.DIAGNOSTICS_COLLECTOR_URL,

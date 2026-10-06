@@ -14,7 +14,7 @@ async function start(options: ServerOptions = {}) {
   const monitor = createMonitoringServer({ staticDir: false, pollMs: 60_000, ...options });
   running.push(monitor);
   const port = await monitor.listen(0);
-  return { monitor, url: `http://127.0.0.1:${port}`, wsUrl: `ws://127.0.0.1:${port}/ws/telemetry` };
+  return { monitor, url: `http://127.0.0.1:${port}`, wsUrl: `ws://127.0.0.1:${port}/ws/payments` };
 }
 
 async function post(url: string, path: string, body?: unknown, headers: Record<string, string> = {}) {

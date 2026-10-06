@@ -12,10 +12,16 @@ import { Simulator } from '../shared/simulator.ts';
 import { HttpTelemetryCollector } from './adapters/collector.ts';
 import type { LiveActionProvider, TelemetryCollector } from './adapters/collector.ts';
 import { Security } from './security.ts';
+import { ControlRuntime, attachControlRoutes } from './control.ts';
+import { environmentSchema } from '../shared/enterprise.ts';
+import type { Environment } from '../shared/enterprise.ts';
 import type { SecurityOptions } from './security.ts';
 
 export interface ServerOptions extends SecurityOptions {
   mode?: 'mock' | 'live';
+  controlStatePath?: string;
+  enterpriseCollectorUrl?: string;
+  enterpriseCollectorToken?: string;
   simulator?: Simulator;
   collector?: TelemetryCollector;
   liveActions?: LiveActionProvider;
@@ -85,7 +91,7 @@ export class MonitoringRuntime {
 const txIdSchema = z.string().min(1).max(160).regex(/^[A-Za-z0-9_.:-]+$/);
 const scenarioBodySchema = z.object({ scenario: scenarioSchema }).strict();
 
-export function createApp(options: ServerOptions = {}, runtime = new MonitoringRuntime(options)): Express {
+export function createApp(options: ServerOptions = {}, runtime = new MonitoringRuntime(options), control = new ControlRuntime(options)): Express {
   const app = express();
   app.disable('x-powered-by');
   app.locals.runtime = runtime;
@@ -105,6 +111,7 @@ export function createApp(options: ServerOptions = {}, runtime = new MonitoringR
   app.post('/api/session', runtime.security.rateLimit, runtime.security.login);
   app.delete('/api/session', runtime.security.rateLimit, runtime.security.logout);
   app.use('/api', runtime.security.authenticate);
+  attachControlRoutes(app,runtime,options,control);
 
   app.get('/api/telemetry', (_req, res) => {
     const value = runtime.getTelemetry();
@@ -189,27 +196,31 @@ export interface MonitoringServer {
 
 export function createMonitoringServer(options: ServerOptions = {}): MonitoringServer {
   const runtime = new MonitoringRuntime(options);
-  const app = createApp(options, runtime);
+  const control = new ControlRuntime(options);
+  const app = createApp(options, runtime, control);
   const server = createServer(app);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   let timer: ReturnType<typeof setInterval> | undefined;
   let shuttingDown = false;
-  const sockets = new Map<WebSocket, { authenticated: () => boolean; alive: boolean }>();
+  const sockets = new Map<WebSocket, { authenticated: () => boolean; alive: boolean; environment: Environment; enterprise: boolean }>();
 
   server.on('upgrade', (req, socket, head) => {
-    if (req.url !== '/ws/telemetry') { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroy(); return; }
+    const wsUrl = new URL(req.url ?? '/', 'http://localhost');
+    const enterprise = wsUrl.pathname === '/ws/telemetry';
+    const parsedEnv = environmentSchema.safeParse(wsUrl.searchParams.get('environment') ?? 'Production');
+    if (!parsedEnv.success || !['/ws/telemetry','/ws/payments'].includes(wsUrl.pathname)) { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroy(); return; }
     if (!runtime.security.validOrigin(req) || !runtime.security.authenticated(req)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
     }
     if (shuttingDown) { socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, ws => {
-      sockets.set(ws, { authenticated: () => runtime.security.authenticated(req), alive: true });
+      sockets.set(ws, { authenticated: () => runtime.security.authenticated(req), alive: true, environment: parsedEnv.data, enterprise });
       ws.on('pong', () => { const state = sockets.get(ws); if (state) state.alive = true; });
       ws.on('close', () => { sockets.delete(ws); });
       ws.on('error', () => { ws.terminate(); });
       // This is a one-way telemetry channel; actions must use authenticated REST.
       ws.on('message', () => { ws.close(1008, 'Use REST endpoints for actions.'); });
-      const telemetry = runtime.getTelemetry();
+      const telemetry = enterprise ? control.snapshot(parsedEnv.data) : runtime.getTelemetry();
       if (telemetry) ws.send(JSON.stringify(telemetry));
       else ws.close(1013, 'Telemetry source unavailable.');
     });
@@ -217,12 +228,12 @@ export function createMonitoringServer(options: ServerOptions = {}): MonitoringS
 
   let ticks = 0;
   const broadcast = async () => {
-    await runtime.refresh();
+    await Promise.all([runtime.refresh(),control.tick()]);
     if (shuttingDown) return;
-    const telemetry = runtime.getTelemetry();
     ticks++;
     for (const [ws, state] of sockets) {
       if (ws.readyState !== WebSocket.OPEN) continue;
+      const telemetry = state.enterprise ? control.snapshot(state.environment) : runtime.getTelemetry();
       if (!state.authenticated()) { ws.close(1008, 'Session expired.'); continue; }
       if (!telemetry) { ws.close(1013, 'Telemetry source unavailable.'); continue; }
       if (ws.bufferedAmount > 1_000_000) { ws.terminate(); continue; }
@@ -236,7 +247,7 @@ export function createMonitoringServer(options: ServerOptions = {}): MonitoringS
 
   return { app, server, wss, runtime,
     async listen(port = 3001, host = '127.0.0.1') {
-      await runtime.refresh();
+      await Promise.all([runtime.refresh(),control.tick()]);
       await new Promise<void>((resolveListen, reject) => {
         const failed = (error: Error) => reject(error);
         server.once('error', failed);

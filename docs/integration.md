@@ -1,80 +1,94 @@
-# Connecting Flowstead to IBM ACE and IBM MQ
+# IBM ACE / IBM MQ integration
 
-The checked-in application is immediately usable with simulated payments. Connecting it to an enterprise installation requires a telemetry collector that understands the organization's payment routes, success criteria, audit database, and monitoring configuration. The repository contains working read-only ACE and MQ clients, a validated collector transport, and an explicit interface for an audited action service. No IBM cluster or real bank credentials were available for end-to-end live verification.
+The enterprise console runs completely in simulation by default. A live deployment needs an authenticated collector that combines ACE flow statistics, MQ counters, resource instrumentation and business audit outcomes. No live IBM installation or bank credentials were available for verification.
 
 ## Runtime configuration
 
-The server reads `.env` at startup. It defaults to loopback port 3001 and mock data. The development frontend proxies `/api` and `/ws` to that server. After building the frontend, the same server also serves `dist`.
-
-| Variable | Purpose |
+| Variable | Meaning |
 | --- | --- |
-| `DATA_MODE` | `mock` (default) or `live`; invalid values prevent startup. |
-| `PORT` / `HOST` | Defaults: `3001` / `127.0.0.1`. |
-| `NODE_ENV` | Set `production` behind your HTTPS reverse proxy to enable secure cookies and the production content security policy. |
-| `PUBLIC_ORIGIN` | Exact external origin, for example `https://payments-ops.example.com`. Development defaults to `http://localhost:5173`. |
-| `OPERATOR_TOKEN` | Operator sign-in secret. Mandatory in live mode; optional for the local mock. Use a long random secret provided by your secret manager. |
-| `TELEMETRY_COLLECTOR_URL` | Full URL of an authenticated endpoint returning the exact `Telemetry` object defined in `shared/types.ts`. |
-| `DIAGNOSTICS_COLLECTOR_URL` | Optional full URL returning the separate `Diagnostics` object. Needed for real p95, ingestion/consumption, GC markers, and heap history. |
-| `COLLECTOR_TOKEN` | Bearer token for both collector endpoints. |
-| `COLLECTOR_USERNAME` / `COLLECTOR_PASSWORD` | Optional Basic authentication alternative to a collector bearer token. |
-| `NODE_EXTRA_CA_CERTS` | Node's standard option for a private certificate authority. Certificate verification remains enabled. |
+| `DATA_MODE` | `mock` (default) or `live` |
+| `HOST`, `PORT` | Bind address, default `127.0.0.1:3001` |
+| `PUBLIC_ORIGIN` | Exact browser-facing origin; development defaults to `http://localhost:5173` |
+| `OPERATOR_TOKEN` | Operator login secret; mandatory in live mode |
+| `ENTERPRISE_COLLECTOR_URL` | Full endpoint returning the strict `TelemetryPayload` in `shared/enterprise.ts` |
+| `COLLECTOR_TOKEN` | Required bearer token when an enterprise live collector is configured |
+| `CONTROL_STATE_PATH` | Atomic mock state file, default `data/control-state.json` |
+| `NODE_EXTRA_CA_CERTS` | Optional private CA certificate bundle; TLS validation stays enabled |
 
-Use HTTPS for production collector URLs, keep credentials out of browser bundles, and forward the public Host and WebSocket Upgrade headers from the reverse proxy. If the proxy rewrites Host, configure `PUBLIC_ORIGIN` to match the browser. The browser, API and WebSocket must share one origin. Do not put secrets in a URL.
+`npm run dev` starts API and frontend. `npm run build` creates `dist`; `npm start` serves it together with the API. Production should use an HTTPS reverse proxy with WebSocket Upgrade forwarding and one browser/API origin. Collector redirects and embedded URL credentials are rejected; production requires an HTTPS collector. Secrets stay on the server.
 
-In live mode, unavailable credentials, an invalid payload, or a sample older than five seconds cause `/api/telemetry` to return `503`. WebSocket clients close with code `1013`; they receive no fabricated healthy snapshot. The server rejects samples more than five seconds in the future. Diagnostics are independently unavailable if their collector is absent or stale. Adapt the collector polling interval to the source's actual sampling capabilities; do not relabel old measurements as current.
+The collector receives `?environment=Development`, `?environment=SIT%20%2F%20UAT`, or `?environment=Production`. Each environment is collected and validated separately. Samples older than five seconds or more than five seconds in the future are unavailable. Failed live collection never substitutes a mock snapshot. WebSocket clients reconnect with bounded exponential backoff. Mutations are disabled without fresh data.
 
-## Authentication and API contract
+## Enterprise API
 
-`GET /api/config` is public and returns `{ mode, actionsEnabled, scenario, authenticationRequired }`. When authentication is configured, `POST /api/session` with JSON `{ "token": "…" }` creates an eight-hour, HttpOnly, SameSite=Strict session. Production cookies require HTTPS. `DELETE /api/session` revokes it. Tokens are compared using a constant-time digest comparison and never included in responses or normal logs. Cookies and sessions are process-local; restart signs users out.
+Every endpoint below accepts an `environment` query parameter, defaulting to `Production`. Authentication and origin checks apply to all of them.
 
-| Endpoint | Result |
+| Endpoint | Contract |
 | --- | --- |
-| `GET /api/telemetry` | Exact telemetry schema; no envelope or extra keys. |
-| `GET /api/diagnostics` | Separate strict diagnostics schema. |
-| `WS /ws/telemetry` | Immediate snapshot, then updates every 1,000ms. Session and origin checked at handshake; sessions rechecked during broadcast. |
-| `POST /api/scenario` | `{ "scenario": "normal" }`; mock only. Other IDs: `flash_sale`, `bni_timeout`, `dlq_influx`, `bca_outage`, `thread_starvation`. |
-| `POST /api/channels/:id/ping` | Simulated active check in mock mode; an explicitly supplied action provider in live mode. |
-| `GET /api/dlq/:txId` | `{ "tx_id": "…", "payload": { … } }`. |
-| `POST /api/dlq/:txId/retry` | Requeues one item with its idempotency key preserved. |
-| `DELETE /api/dlq/:txId` | Discards one item. |
+| `GET /api/control/snapshot` | Exact enterprise `TelemetryPayload`, no envelope |
+| `WS /ws/telemetry` | Immediate enterprise snapshot, then updates every 1,000 ms |
+| `GET /api/control/details` | `{registry, queues, audit, mode, actionsEnabled}` |
+| `POST /api/control/services` | `{service: ServiceMetadata, reason}`; registers a stopped service |
+| `PUT /api/control/services/:id` | `{service: ServiceMetadata, reason}`; updates metadata/runtime configuration |
+| `POST /api/control/services/:id/lifecycle` | `{action: "start" | "stop" | "restart" | "archive", reason}` |
+| `GET /api/control/dlq/:id` | Masked payload inspection |
+| `POST /api/control/dlq/actions` | `{ids: string[], action: "retry" | "discard", reason}` |
+| `GET /api/control/diagnostic-bundle` | Masked telemetry and operator audit JSON |
 
-Actions return `{ "ok": boolean, "message": string }`. Invalid input is `400`, authentication failures `401`, disallowed actions/origins `403`, missing payloads `404`, unsuccessful/conflicting operations `409`, rate limits `429`, and unavailable sources `503`. An offline partner probe returns `409` with `ok: false`, not an invented successful ping. The mock rejects replay to an offline channel and rejects duplicate handling of the same transaction. Switching scenarios resets the demo inventory.
+Reasons must contain 5–500 characters. Bulk commands accept 1–100 unique message IDs. All targets are validated before mutation; a stopped/error target blocks the entire replay. Already-handled messages return a conflict. Archival requires a stopped service with empty queues and no dead letters. Restart simulates a graceful drain and restart; it does not invoke a real ACE node.
 
-The API rejects foreign origins and cross-site requests, does not enable CORS, limits JSON bodies to 16KB, and limits actions/sign-in to 60 requests per client IP per minute. Payload reads also consume this action allowance. The server intentionally does not trust forwarded client IPs. Behind a reverse proxy the allowance is shared by clients of that proxy; use a perimeter rate limiter and a reviewed trusted-proxy configuration if per-user scaling is needed.
+Mock commands synchronously persist their audit and state in an atomically replaced file with mode 0600. Persistence failure rolls back the in-memory operation. This is a single-process demonstration store, not a distributed transaction or immutable production audit system. Environment namespaces isolate the data; their names do not imply that real clusters are connected.
 
-## IBM ACE adapter
+Live `/details` currently exposes no configuration, queue-rate enrichment or audit provider. The main telemetry contract still supplies service status, node statistics, queue depths and masked DLQ summaries. Live administration and full payload inspection return 403 until an organizational provider is implemented. Do not simply remove that guard.
 
-`IbmAceAdminClient` in `server/adapters/ibm.ts` implements `AceAdminAdapter.listMessageFlows(server, application?)`. For a specified application it queries `/apiv2/servers/{server}/applications/{application}/messageflows`. Without an application it first discovers application, REST API and service containers, then reads each container's flow collection. Set `independentServer: true` to omit `/servers/{server}` for an independent server. Identifiers are URL-encoded; the client uses authenticated GET requests with a three-second timeout. Supply a base URL for the administration listener and server-side credentials.
+The earlier five-bank telemetry API remains available for compatibility at `/api/telemetry`, `/api/diagnostics` and `/ws/payments`. Its scenario, ping and payment replay routes are separate from the enterprise registry and are not used by the enterprise UI.
 
-The requested `/apiv2/servers/{server}/messageflows` shorthand is absent from the [official ACE 13.0.5 OpenAPI](https://github.com/ot4i/ace-admin-api/blob/main/13.0.5.0/openapi-appconnectenterprise.yaml); the implementation uses its documented scoped endpoints. This adapter lists directly contained flows. If your integrations package flows inside static libraries, extend discovery through those libraries using the corresponding documented library scope.
+## Authentication and transport
 
-Inspect the deployed installation's `/apidocs` to confirm paths and flow scope for its exact version. Listing flows is an inventory operation; it does not supply payment TPS, final business success, or a latency percentile. See [IBM's message flow administration documentation](https://www.ibm.com/docs/en/app-connect/13.0.x?topic=mrbuara-administering-message-flows-by-using-administration-rest-api) and the [ACE administration API documentation location](https://www.ibm.com/docs/en/app-connect/13.0.x?topic=mrbuara-setting-message-flow-user-defined-properties-run-time-by-using-administration-rest-api).
+Public `GET /api/config` reports data mode and authentication requirements. `POST /api/session` with `{token}` establishes an eight-hour HttpOnly, SameSite=Strict cookie. Production cookies are Secure; use HTTPS. `DELETE /api/session` revokes the session. Server tokens are compared using a constant-time digest check and never saved in browser storage. Sessions are process-local and expire on restart.
 
-ACE contains both native and Java processing. JVM heap is one resource, not total server resident memory. Enable resource statistics and read used/max heap plus actual cumulative GC counters; changes in these counters identify observed GC events. Do not infer GC events solely from an arbitrary heap dip. See [IBM JVM resource statistics](https://www.ibm.com/docs/en/app-connect/11.0.0?topic=data-java-virtual-machine-jvm).
+The server checks HTTP and WebSocket origins, rechecks authentication during broadcasts, rejects cross-site requests, limits JSON bodies to 16 KB, and rate-limits actions and sign-in. Status codes: 400 validation, 401 authentication, 403 disallowed operation/origin, 404 missing payload, 409 conflict, 429 rate limit, 503 unavailable telemetry. Forwarded client addresses are intentionally not trusted; configure a reviewed perimeter limiter when deploying behind a proxy.
 
-## IBM MQ adapter
+## ACE and MQ adapters
 
-`IbmMqRestCollector` implements `MqStatisticsCollector.readQueue(queueManager, queue)`. It reads `/ibmmq/rest/v1/admin/qmgr/{qmgr}/queue/{queue}?status=status.currentDepth&attributes=storage.maximumDepth`, validates integer depths, and returns a collection timestamp. It never browses, consumes or requeues a message.
+`server/adapters/ibm.ts` contains `IbmAceAdminClient` and `IbmMqRestCollector`. ACE inventory discovers application, REST API and service containers before reading scoped message-flow collections. An independent integration server omits `/servers/{server}`. IDs are URL-encoded and calls use authentication, timeouts and TLS verification.
 
-That queue resource is specifically an administrative REST **v1** endpoint and is unavailable in stand-alone mqweb installations. IBM directs v3 administration clients to the MQSC action resource. For such installations, implement the same collector interface using an approved PCF/MQSC collector; do not simply replace `v1` with `v3`. Required authorities include queue and queue-status inquiries. See [IBM MQ queue GET reference](https://www.ibm.com/docs/en/ibm-mq/9.4.x?topic=adminqmgrqmgrnamequeue-get).
+For ACE 13.0.5, application-scoped lifecycle routes include:
 
-Queue depth alone cannot tell ingestion and consumption rates. The collector must track appropriate MQ statistics counters and sample duration, handling queue-manager restarts and counter resets. Partner business health and payment completion also require application telemetry. A low queue depth does not prove that upstream traffic is reaching ACE.
+```
+POST /apiv2/servers/{server}/applications/{application}/messageflows/{messageflow}/start
+POST /apiv2/servers/{server}/applications/{application}/messageflows/{messageflow}/stop
+```
 
-## Building the enterprise collector and enabling actions
+Confirm scope and properties using your installed version's `/apidocs`. UDP changes, additional instances and user trace have version- and scope-specific administration behavior; per-service trace controls in this demo must not be mapped blindly to a server-wide trace endpoint. See [IBM message-flow administration](https://www.ibm.com/docs/en/app-connect/13.0.x?topic=mrbuara-administering-message-flows-by-using-administration-rest-api) and the [official ACE OpenAPI](https://github.com/ot4i/ace-admin-api/blob/main/13.0.5.0/openapi-appconnectenterprise.yaml).
 
-The default live transport polls your configured collector endpoints. The IBM client classes are reusable building blocks for that collector; they are not automatically combined into fabricated channel metrics. For each field, define the data source, aggregation window, and meaning:
+The MQ client queries administrative REST v1 queue depth and maximum depth. That resource is not available in standalone mqweb; v3 uses MQSC action resources, so use an approved PCF/MQSC collector where appropriate. The read-only client never browses or requeues messages. See [IBM MQ queue GET](https://www.ibm.com/docs/en/ibm-mq/9.4.x?topic=adminqmgrqmgrnamequeue-get).
 
-- Aggregate TPS from the five channels with one consistent transaction boundary; avoid double-counting retries as distinct paid orders.
-- Calculate daily volume and success from the payment audit store using the business-day timezone (the demonstration uses Asia/Jakarta).
-- Calculate p95 from actual latency observations or an aggregatable histogram. Never multiply average latency by a guessed factor.
-- Obtain thread capacity, JVM statistics and database pool usage from actual ACE/runtime instrumentation. Return unknown p95 as `null`; unavailable required telemetry must fail validation instead of silently becoming zero.
-- Collect bank reachability from approved endpoint probes, and preserve transaction/correlation IDs through incident ingestion. Redact personal/payment details before returning payload snippets to the browser.
-- Publish the exact primary schema and the separate diagnostics schema. The strict validator rejects unexpected fields, duplicate channel IDs, invalid counts, and impossible thread/pool occupancy.
+## Telemetry and masking semantics
 
-Live replay and discard are disabled by default (`actionsEnabled: false`). To enable them, explicitly inject a `LiveActionProvider` into `createMonitoringServer`. The service implementation must reconcile the provider's payment outcome before replay, persist idempotency decisions across restarts, authorize operators, preserve original correlation and idempotency IDs, record an audit trail, and implement the organization's discard policy. A network timeout alone does not establish that the bank failed to execute a payment.
+- TPS must use consistent transaction boundaries across services, with retries distinguished from unique business outcomes.
+- Daily volume uses Asia/Jakarta in the demo. Success/failure counts must come from reconciled final outcomes in a real installation.
+- Compute p95 from measured latency samples or histograms. The seeded p95 values are simulated measurements, not multiples of an average.
+- Sequential node-average waterfalls show relative time spent. They are not individual distributed traces. Error terminal counters are aggregated in the provided contract.
+- JVM heap is one part of ACE resource usage. Heap dips do not prove garbage collection; a rising snapshot does not establish a memory leak.
+- MQ ingestion, consumption and oldest-message age require instrumentation beyond queue depth. Mock queue metrics are illustrative; unreported live enrichment is left unavailable.
+- JSON fields, known XML elements/attributes and recognized Base64 structured bodies are masked before payload transmission. Opaque Base64 is withheld. Extend the policy for organization-specific fields and enforce redaction at collection time. Do not put credentials in node URLs, logs or audit reasons.
+- BIP translation is context-aware local rule matching. A wrapper code alone does not establish a root cause. Remediation should use nested exceptions and actual partner/network evidence.
 
-This repository's in-memory sessions, demo history, and simulated idempotency set are suitable for the immediately runnable demonstration and one application process. Production rollout additionally needs your identity/access integration, durable audit/replay service, collector deployment and validation, secret rotation, centralized logs, backup/retention policies, and operational ownership. None of those external systems are implied to be configured by starting the demo.
+## Production rollout boundary
+
+Connect enterprise SSO/RBAC, durable audit and session storage, retention controls, collector monitoring, and a reviewed ACE/MQ administration provider. A payment timeout does not establish whether the partner executed the payment: reconcile the business outcome before retry, and preserve correlation and idempotency identifiers in a durable replay service.
+
+Host the persistent Node WebSocket/API process on infrastructure that supports long-lived connections. The frontend may be hosted separately only with a deliberately reviewed API/authentication/proxy configuration. Installing the Vercel plugin does not deploy the service or configure that architecture.
+
+## Living Town
+
+The optional visual view uses the same enterprise snapshot and existing administration flows. `shared/town.ts` projects selected-service telemetry without modifying it. Demo Payment Gateway bank traffic is an illustrative distribution, clearly labeled in the UI; live bank-level values are unknown rather than inferred from aggregate flow health. Other services use measured node latency and status. Stale telemetry freezes motion; pausing motion does not pause monitoring.
+
+Process village renders all supplied nodes, in source order, with extra rows for longer flows. `shared/processActivities.ts` classifies node types and descriptive names into receiving, validation, transformation, routing, aggregation, partner requests, storage, delivery or generic computation. Unknown Compute nodes remain generic. A stopped flow is idle; error nodes block downstream visual traffic; bottleneck latency slows crates. Node inspector values are the original snapshot counters and latencies. Routing branches, aggregation batch sizes, worker assignment and message colors are illustrative, not observed traces or branch-level telemetry.
+
+The mock model now seeds business-specific Compute operations across the 26 services. On loading saved demo state it updates names/types only for untouched legacy sample pipelines. It preserves lifecycle state, configuration, metrics, DLQ decisions and audit history; custom node definitions and live collector data are not rewritten. This does not modify any deployed ACE flows.
 
 ## Verification
 
-`tests/server.test.ts` exercises real HTTP and WebSocket connections, strict schema output, scenarios, failed probes, blocked offline retries, concurrent duplicate replay, discard, protected payloads, operator sessions, WebSocket authentication, cross-origin rejection, body/rate limits, stale-live failure, and IBM adapter request paths. The tests use local simulated samples and injected HTTP responses; they do not contact payment providers.
+`tests/enterprise.test.ts` exercises domain counts, node counter conservation, schema validation, configuration constraints, lifecycle/archive guards, atomic bulk replay, persistent duplicate protection, rollback on failed persistence, masking, environment isolation, HTTP authentication, strict WebSocket updates and fail-closed live mode. Payment compatibility and adapter request tests remain in `tests/server.test.ts` and `tests/simulator.test.ts`. Browser verification covers catalog navigation, configuration, pipeline inspection, queue actions, incident filters and responsive layout.

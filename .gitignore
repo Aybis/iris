@@ -4,3 +4,8 @@ dist/
 playwright-report/
 test-results/
 .DS_Store
+
+data/
+.env
+.env.*
+!.env.example
